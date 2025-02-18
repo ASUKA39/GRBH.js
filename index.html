@@ -22,7 +22,15 @@
             height: 100vh;
         }
     </style>
-    <canvas id="myCanvas" width="2560" height="1440"></canvas>
+    <!-- <canvas id="myCanvas" width="2560" height="1440"></canvas> -->
+    <!-- <canvas id="myCanvas" width="1470" height="956"></canvas> -->
+    <canvas id="myCanvas"></canvas>
+    <script>
+        // 自适应屏幕（单位pixel）
+        var canvas = document.getElementById('myCanvas');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    </script>
 </body>
 <script>
     function ShaderToyLite(canvasId) {
@@ -179,7 +187,14 @@
                 iMouse.y = 0.5 * gl.canvas.height + 0.05 * Math.random() * gl.canvas.height * isMinus;
                 // iMouse.clickX = Math.random() * gl.canvas.width;
                 // iMouse.clickY = Math.random() * gl.canvas.height;
-            }, 10000);
+            }, 100000);
+
+            // callback获取窗口大小（单位pixel）
+            window.addEventListener('resize', function () {
+                gl.canvas.width = canvas.width;
+                gl.canvas.height = canvas.height;
+                gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+            });
         }
 
         var createTexture = () => {
