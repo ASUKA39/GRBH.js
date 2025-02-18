@@ -1,0 +1,1391 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ShaderToyLite</title>
+</head>
+
+<body>
+    <style>
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+
+        #myCanvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+        }
+    </style>
+    <canvas id="myCanvas" width="2560" height="1440"></canvas>
+</body>
+<script>
+    function ShaderToyLite(canvasId) {
+        var hdr =
+            `#version 300 es
+            #ifdef GL_ES
+            precision highp float;
+            precision highp int;
+            precision mediump sampler3D;
+            #endif
+            #define texture2D texture
+            uniform vec3      iResolution;           // viewport resolution (in pixels)
+            uniform float     iTime;                 // shader playback time (in seconds)
+            uniform float     iTimeDelta;            // render time (in seconds)
+            uniform float     iFrameRate;            // shader frame rate
+            uniform int       iFrame;                // shader playback frame
+            uniform float     iChannelTime[4];       // channel playback time (in seconds)
+            uniform vec3      iChannelResolution[4]; // channel resolution (in pixels)
+            uniform vec4      iMouse;                // mouse pixel coords. xy: current (if MLB down), zw: click
+            uniform sampler2D iChannel0;             // input channel 0
+            uniform sampler2D iChannel1;             // input channel 1
+            uniform sampler2D iChannel2;             // input channel 2
+            uniform sampler2D iChannel3;             // input channel 3
+            uniform vec4      iDate;                 // (year, month, day, unixtime in seconds)
+            uniform float     iSampleRate;           // sound sample rate (i.e., 44100)
+            out vec4          frag_out_color;
+            void mainImage( out vec4 c, in vec2 f );
+            void main( void )
+            {
+                vec4 color = vec4(0.0,0.0,0.0,0.0);
+                mainImage( color, gl_FragCoord.xy );
+                frag_out_color = vec4(color);
+            }
+            `;
+
+        const basicVertexShader =
+            `#version 300 es
+            #ifdef GL_ES
+            precision highp float;
+            precision highp int;
+            precision mediump sampler3D;
+            #endif
+            in vec2 vertexInPosition;
+            void main() {
+                gl_Position = vec4(vertexInPosition, 0.0, 1.0);
+            }
+            `;
+
+        const quadVertices = new Float32Array([
+            -1.0, -1.0,
+            1.0, -1.0,
+            -1.0, 1.0,
+            1.0, 1.0,
+            -1.0, 1.0,
+            1.0, -1.0
+        ]);
+
+        var opts = {
+            alpha: false,
+            depth: false,
+            stencil: false,
+            premultipliedAlpha: false,
+            antialias: true,
+            preserveDrawingBuffer: false,
+            powerPreference: "high-performance"
+        };
+
+        var gl = document.getElementById(canvasId).getContext('webgl2', opts);
+
+        // timing
+        var isPlaying = false;
+        var firstDrawTime = 0;
+        var prevDrawTime = 0;
+
+        // callback
+        var onDrawCallback;
+
+        // uniforms
+        var iFrame = 0;
+        // var iMouse = { x: 0, y: 0, clickX: 0, clickY: 0 };
+        var iMouse = { x: Math.random() * gl.canvas.width, y: 0.5 * gl.canvas.height + 0.05 * Math.random() * gl.canvas.height, clickX: 0, clickY: 0 };
+
+        // shader common source 
+        var common = "";
+
+        // render passes variables. valid keys:
+        //   'A', 'B', 'C', 'D', 'Image' 
+        var sourcecode = {};// fragment shader code
+        var ichannels = {}; // texture inputs
+        var atexture = {};  // front texture (input/output)
+        var btexture = {};  // back texture  (input/output)
+        var aframebuf = {}; // front buffer (output)
+        var bframebuf = {}; // back buffer (output)
+        var program = {};   // webgl program
+        var location = {}; // uniform location
+        var flip = {};      // a b flip
+
+        var setup = () => {
+            gl.getExtension('OES_texture_float_linear');
+            gl.getExtension('OES_texture_half_float_linear');
+            gl.getExtension('EXT_color_buffer_float');
+            gl.getExtension('WEBGL_debug_shaders');
+
+            ['A', 'B', 'C', 'D', 'Image'].forEach((key) => {
+                sourcecode[key] = "";
+                ichannels[key] = {};
+                program[key] = null;
+                location[key] = {};
+                if (key != 'Image') {
+                    atexture[key] = createTexture();
+                    btexture[key] = createTexture();
+                    aframebuf[key] = createFrameBuffer(atexture[key]);
+                    bframebuf[key] = createFrameBuffer(btexture[key]);
+                    flip[key] = false;
+                }
+            });
+
+            // bind the geometry
+            quadBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
+
+            // Set viewport size
+            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+            var canvas = document.getElementById(canvasId);
+
+            window.addEventListener('resize', function () {
+                gl.canvas.width = canvas.width;
+                gl.canvas.height = canvas.height;
+                gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+            });
+
+            // canvas.addEventListener("mousemove", (event) => {
+            //     iMouse.x = event.offsetX;
+            //     iMouse.y = canvas.height - event.offsetY;
+            // });
+
+            // canvas.addEventListener("mousedown", (event) => {
+            //     iMouse.clickX = event.offsetX;
+            //     iMouse.clickY = canvas.height - event.offsetY;
+            // });
+
+            // canvas.addEventListener("mouseup", () => {
+            //     iMouse.clickX = 0;
+            //     iMouse.clickY = 0;
+            // });
+
+            // 定时随机更新鼠标位置
+            setInterval(() => {
+                isMinus = Math.random() > 0.5 ? 1 : -1;
+                iMouse.x = Math.random() * gl.canvas.width;
+                // iMouse.y = Math.random() * gl.canvas.height;
+                iMouse.y = 0.5 * gl.canvas.height + 0.05 * Math.random() * gl.canvas.height * isMinus;
+                // iMouse.clickX = Math.random() * gl.canvas.width;
+                // iMouse.clickY = Math.random() * gl.canvas.height;
+            }, 10000);
+        }
+
+        var createTexture = () => {
+            var texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, gl.canvas.width, gl.canvas.height, 0, gl.RGBA, gl.FLOAT, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            return texture;
+        }
+
+        var createFrameBuffer = (texture) => {
+            var framebuffer = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+            gl.bindTexture(gl.TEXTURE_2D, null);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            return framebuffer;
+        };
+
+        var compileProgram = (key) => {
+            var vert = gl.createShader(gl.VERTEX_SHADER);
+            gl.shaderSource(vert, basicVertexShader);
+            gl.compileShader(vert);
+
+            if (!gl.getShaderParameter(vert, gl.COMPILE_STATUS)) {
+                console.error('Vertex Shader compilation failed: ' + gl.getShaderInfoLog(vert));
+                gl.deleteShader(vert);
+                return null;
+            }
+
+            var source = hdr + common + sourcecode[key];
+            var frag = gl.createShader(gl.FRAGMENT_SHADER);
+            gl.shaderSource(frag, source);
+            gl.compileShader(frag);
+
+            if (!gl.getShaderParameter(frag, gl.COMPILE_STATUS)) {
+                console.error('Fragment Shader compilation failed: ' + gl.getShaderInfoLog(frag));
+                console.error(source);
+                gl.deleteShader(frag);
+                return null;
+            }
+
+            var program = gl.createProgram();
+            gl.attachShader(program, vert);
+            gl.attachShader(program, frag);
+            gl.linkProgram(program);
+
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error('Program initialization failed: ' + gl.getProgramInfoLog(program));
+                return null;
+            }
+
+            // uniform locations
+            location[key]["iResolution"] = gl.getUniformLocation(program, "iResolution");
+            location[key]["iTime"] = gl.getUniformLocation(program, "iTime");
+            location[key]["iTimeDelta"] = gl.getUniformLocation(program, "iTimeDelta");
+            location[key]["iFrameRate"] = gl.getUniformLocation(program, "iFrameRate");
+            location[key]["iFrame"] = gl.getUniformLocation(program, "iFrame");
+            location[key]["iChannelTime"] = gl.getUniformLocation(program, "iChannelTime[0]");
+            location[key]["iChannelResolution"] = gl.getUniformLocation(program, "iChannelResolution[0]");
+            location[key]["iChannel0"] = gl.getUniformLocation(program, "iChannel0");
+            location[key]["iChannel1"] = gl.getUniformLocation(program, "iChannel1");
+            location[key]["iChannel2"] = gl.getUniformLocation(program, "iChannel2");
+            location[key]["iChannel3"] = gl.getUniformLocation(program, "iChannel3");
+            location[key]["iMouse"] = gl.getUniformLocation(program, "iMouse");
+            location[key]["iDate"] = gl.getUniformLocation(program, "iDate");
+            location[key]["iSampleRate"] = gl.getUniformLocation(program, "iSampleRate");
+            location[key]["vertexInPosition"] = gl.getAttribLocation(program, "vertexInPosition");
+
+            return program;
+        };
+
+        var repeat = (times, arr) => {
+            let result = [];
+            for (let i = 0; i < times; i++) {
+                result = [...result, ...arr];
+            }
+            return result;
+        }
+
+        var setShader = (config, key) => {
+            if (config) {
+                if (config.source) {
+                    sourcecode[key] = config.source;
+                    program[key] = compileProgram(key);
+                    if (program[key] == null) {
+                        console.error("Failed to compile " + key);
+                    }
+                }
+                for (let i = 0; i < 4; i++) {
+                    var s = config[`iChannel${i}`];
+                    if (s == "A" || s == "B" || s == "C" || s == "D") {
+                        ichannels[key][i] = s;
+                    }
+                }
+            } else {
+                sourcecode[key] = "";
+                program[key] = null;
+            }
+        };
+
+        var draw = () => {
+
+            // current time
+            var now = isPlaying ? Date.now() : prevDrawTime;
+            var date = new Date(now);
+
+            // first draw?
+            if (firstDrawTime == 0) {
+                firstDrawTime = now;
+            }
+
+            // call callback
+            if (onDrawCallback) {
+                onDrawCallback();
+            }
+
+            // time difference between frames in seconds
+            var iTimeDelta = (now - prevDrawTime) * 0.001;
+
+            // time in seconds
+            var iTime = (now - firstDrawTime) * 0.001;
+            var iDate = [date.getFullYear(), date.getMonth(), date.getDate(), date.getTime() * 0.001];
+
+            // channel uniforms
+            var iChannelTimes = new Float32Array(repeat(4, [iTime]));
+            var iChannelResolutions = new Float32Array(repeat(4, [gl.canvas.width, gl.canvas.height, 0]));
+
+            ['A', 'B', 'C', 'D', 'Image'].forEach((key) => {
+
+                if (program[key]) {
+
+                    // framebuffer
+                    if (key === "Image") {
+                        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                    } else {
+                        var output = flip[key] ? bframebuf[key] : aframebuf[key];
+                        gl.bindFramebuffer(gl.FRAMEBUFFER, output);
+                    }
+
+                    // textures
+                    for (let i = 0; i < 4; i++) {
+                        var chkey = ichannels[key][i];
+                        if (chkey) {
+                            var input = flip[chkey] ? atexture[chkey] : btexture[chkey];
+                            gl.activeTexture(gl[`TEXTURE${i}`]);
+                            gl.bindTexture(gl.TEXTURE_2D, input);
+                        }
+                    }
+
+                    // program
+                    gl.useProgram(program[key]);
+
+                    // uniforms
+                    gl.uniform3f(location[key]["iResolution"], gl.canvas.width, gl.canvas.height, 1.0);
+                    gl.uniform1f(location[key]["iTime"], iTime);
+                    gl.uniform1f(location[key]["iTimeDelta"], iTimeDelta);
+                    gl.uniform1f(location[key]["iFrameRate"], 60);
+                    gl.uniform1i(location[key]["iFrame"], iFrame);
+                    gl.uniform1fv(location[key]["iChannelTime"], iChannelTimes);
+                    gl.uniform3fv(location[key]["iChannelResolution"], iChannelResolutions);
+                    gl.uniform1i(location[key]["iChannel0"], 0);
+                    gl.uniform1i(location[key]["iChannel1"], 1);
+                    gl.uniform1i(location[key]["iChannel2"], 2);
+                    gl.uniform1i(location[key]["iChannel3"], 3);
+                    gl.uniform4f(location[key]["iMouse"], iMouse.x, iMouse.y, iMouse.clickX, iMouse.clickY);
+                    gl.uniform4f(location[key]["iDate"], iDate[0], iDate[1], iDate[2], iDate[3]);
+                    gl.uniform1f(location[key]["iSampleRate"], 44100);
+
+                    // viewport
+                    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+                    // vertexs
+                    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+                    gl.vertexAttribPointer(location[key]["vertexInPosition"], 2, gl.FLOAT, false, 0, 0);
+                    gl.enableVertexAttribArray(location[key]["vertexInPosition"]);
+
+                    // draw
+                    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+                    flip[key] = !flip[key];
+                }
+            });
+
+            // time of last draw
+            prevDrawTime = now;
+
+            // frame counter
+            iFrame++;
+        };
+
+        // Animation loop
+        var animate = () => {
+            if (isPlaying) {
+                draw();
+                requestAnimationFrame(animate);
+            }
+        };
+
+        this.setCommon = (source) => {
+            if (source === undefined) { source = ""; }
+            if (source === null) { source = ""; }
+            common = source;
+            ['A', 'B', 'C', 'D', 'Image'].forEach((key) => {
+                if (program[key]) {
+                    program[key] = compileProgram(key);
+                }
+            });
+        };
+
+        this.setBufferA = (config) => {
+            setShader(config, 'A');
+        };
+
+        this.setBufferB = (config) => {
+            setShader(config, 'B');
+        };
+
+        this.setBufferC = (config) => {
+            setShader(config, 'C');
+        };
+
+        this.setBufferD = (config) => {
+            setShader(config, 'D');
+        };
+
+        this.setImage = (config) => {
+            setShader(config, 'Image');
+        };
+
+        this.setOnDraw = (callback) => {
+            onDrawCallback = callback;
+        }
+
+        this.addTexture = (texture, key) => {
+            atexture[key] = texture;
+            btexture[key] = texture;
+            flip[key] = false;
+        }
+
+        this.time = () => {
+            return (prevDrawTime - firstDrawTime) * 0.001;
+        }
+
+        this.isPlaying = () => isPlaying;
+
+        this.reset = () => {
+            var now = new Date();
+            firstDrawTime = now;
+            prevDrawTime = now;
+            iFrame = 0;
+            draw();
+        }
+
+        this.pause = () => {
+            isPlaying = false;
+        }
+
+        this.play = () => {
+            if (!isPlaying) {
+                isPlaying = true;
+                var now = Date.now();
+                var elapsed = prevDrawTime - firstDrawTime;
+                firstDrawTime = now - elapsed;
+                prevDrawTime = now;
+                animate();
+            }
+        }
+
+        setup();
+    }
+</script>
+
+<script id="A" type="x-shader/x-fragment">
+#define PI 3.141592653589
+#define G0 6.673e-11
+#define lightspeed 299792458.0
+#define sigma 5.670373e-8
+#define ly 9460730472580800.0
+#define Msun 1.9891e30
+#define FOV 0.5
+float RandomStep(vec2 xy, float seed)//用于光线起点抖动的随机
+{
+    return fract(sin(dot(xy.xy+fract(11.4514*sin(seed)), vec2(12.9898, 78.233)))* 43758.5453);
+}
+
+float cubicInterpolation(float t)//从0到1插值,用于perlin noise
+{
+//return t * t * t * (t * (t * 6. - 15.) + 10.);
+return 3.*t*t-2.*t*t*t;
+}
+
+float PerlinNoise(vec3 xyz)//三维perlin noise,用于吸积盘云的随机
+{
+    vec3 p000=vec3(floor(xyz.x),floor(xyz.y),floor(xyz.z));
+    float v000=2.0*fract(sin(dot(vec3(p000.x    ,p000.y    ,p000.z    ), vec3(12.9898, 78.233,213.765)))* 43758.5453)-1.0;
+    float v100=2.0*fract(sin(dot(vec3(p000.x+1.0,p000.y    ,p000.z    ), vec3(12.9898, 78.233,213.765)))* 43758.5453)-1.0;
+    float v010=2.0*fract(sin(dot(vec3(p000.x    ,p000.y+1.0,p000.z    ), vec3(12.9898, 78.233,213.765)))* 43758.5453)-1.0;
+    float v110=2.0*fract(sin(dot(vec3(p000.x+1.0,p000.y+1.0,p000.z    ), vec3(12.9898, 78.233,213.765)))* 43758.5453)-1.0;
+    float v001=2.0*fract(sin(dot(vec3(p000.x    ,p000.y    ,p000.z+1.0), vec3(12.9898, 78.233,213.765)))* 43758.5453)-1.0;
+    float v101=2.0*fract(sin(dot(vec3(p000.x+1.0,p000.y    ,p000.z+1.0), vec3(12.9898, 78.233,213.765)))* 43758.5453)-1.0;
+    float v011=2.0*fract(sin(dot(vec3(p000.x    ,p000.y+1.0,p000.z+1.0), vec3(12.9898, 78.233,213.765)))* 43758.5453)-1.0;
+    float v111=2.0*fract(sin(dot(vec3(p000.x+1.0,p000.y+1.0,p000.z+1.0), vec3(12.9898, 78.233,213.765)))* 43758.5453)-1.0;
+    vec3 pf=vec3(fract(xyz.x),fract(xyz.y),fract(xyz.z));
+    float v00=v001*cubicInterpolation(pf.z)+v000*cubicInterpolation(1.0-pf.z);
+    float v10=v101*cubicInterpolation(pf.z)+v100*cubicInterpolation(1.0-pf.z);
+    float v01=v011*cubicInterpolation(pf.z)+v010*cubicInterpolation(1.0-pf.z);
+    float v11=v111*cubicInterpolation(pf.z)+v110*cubicInterpolation(1.0-pf.z);
+    float v0=v01*cubicInterpolation(pf.y)+v00*cubicInterpolation(1.0-pf.y);
+    float v1=v11*cubicInterpolation(pf.y)+v10*cubicInterpolation(1.0-pf.y);
+    return v1*cubicInterpolation(pf.x)+v0*cubicInterpolation(1.0-pf.x);
+}
+
+float softHold(float x){//使不大于一
+return 1.0-1.0/(max(x,0.0)+1.0);
+}
+
+float DiskRandom0(vec3 EPos,int granularityStart,int granularityEnd,float Contrast){//云场强噪声,输入为  位置（不一定是空间位置,可以经过变形）,细节起始级别,细节终止级别,场强强弱对比度
+    float Result=10.;
+    float Rate=1.;
+    for(int i=granularityStart;i<granularityEnd;i++){
+        Rate=pow(3.0,float(i)); 
+        // 0.1是噪声强度，可以调整
+        Result*=(1.0+0.1*PerlinNoise(vec3(Rate*EPos.x,Rate*EPos.y,Rate*EPos.z))); 
+    }
+    return log(1.+pow(0.1*Result,Contrast));
+}
+
+float Vec2Theta(vec2 a,vec2 b)//两平面向量夹角,0到2pi
+{
+if(dot(a,b)>0.0){
+    return asin(0.999999*(a.x*b.y-a.y*b.x)/length(a)/length(b));
+    }else if(dot(a,b)<0.0 && (-a.x*b.y+a.y*b.x)<0.0){
+    return PI-asin(0.999999*(a.x*b.y-a.y*b.x)/length(a)/length(b));
+    }else if(dot(a,b)<0.0 && (-a.x*b.y+a.y*b.x)>0.0){
+    return -PI-asin(0.999999*(a.x*b.y-a.y*b.x)/length(a)/length(b));
+    }
+}
+
+vec3 RGB(float T) {
+    if(T<400.01){return vec3(0.,0.,0.);}
+    float _ = (T - 6500.0) / (6500.0 * T * 2.2);
+    float R = exp(2.05539304e4 * _);
+    float G = exp(2.63463675e4 * _);
+    float B = exp(3.30145739e4 * _);
+    float LmulRate = 1.0 / max(max(R, G), B);
+    if(T<1000.){
+    LmulRate*=(T-400.)/600.;
+    }
+    R *= LmulRate;
+    G *= LmulRate;
+    B *= LmulRate;
+    return vec3(R, G, B);
+}
+
+float omega(float r,float Rs){//绕黑洞公转速度
+return sqrt(lightspeed/ly*lightspeed*Rs/ly/((2.0*r-3.0*Rs)*r*r));
+}
+
+vec3 GetBH(vec4 a,vec3 BHPos,vec3 DiskDir)//BH系平移旋转
+    {
+    vec3 vecz =vec3( 0.0,0.0,1.0 );
+    if(DiskDir==vecz){
+    DiskDir+=0.0001*(vec3(1.0,0.,0.));
+    }
+        vec3 _X = normalize(cross(vecz, DiskDir));
+        vec3 _Y = normalize(cross(DiskDir, _X));
+        vec3 _Z = normalize(DiskDir);
+    a=(transpose(mat4x4(
+        1., 0., 0., -BHPos.x,
+        0., 1., 0., -BHPos.y,
+        0., 0., 1., -BHPos.z,
+        0., 0., 0., 1.
+    ))*a);
+    a=transpose(mat4x4(
+        _X.x,_X.y,_X.z,0.,
+        _Y.x,_Y.y,_Y.z,0.,
+        _Z.x,_Z.y,_Z.z,0.,
+        0.   ,0.   ,0.   ,1.)
+        )*a;
+    return a.xyz;
+}
+
+vec3 GetBHRot(vec4 a,vec3 BHPos,vec3 DiskDir)//BH系旋转
+    {
+    vec3 vecz =vec3( 0.0,0.0,1.0 );
+    if(DiskDir==vecz){
+    DiskDir+=0.0001*(vec3(1.0,0.,0.));
+    }
+    vec3 _X = normalize(cross(vecz, DiskDir));
+    vec3 _Y = normalize(cross(DiskDir, _X));
+    vec3 _Z = normalize(DiskDir);
+
+    a=transpose(mat4x4(
+        _X.x,_X.y,_X.z,0.,
+        _Y.x,_Y.y,_Y.z,0.,
+        _Z.x,_Z.y,_Z.z,0.,
+        0.   ,0.   ,0.   ,1.)
+        )*a;
+    return a.xyz;
+}
+
+vec4 GetCamera(vec4 a)//相机系平移旋转  本部分在实际使用时uniform输入
+{
+float _Theta=4.0*PI*iMouse.x/iResolution.x;
+float _Phi=0.999*PI*iMouse.y/iResolution.y+0.0005;
+float _R=0.000057;
+
+if(iFrame<2){
+    _Theta=4.0*PI*0.45;
+    _Phi=0.999*PI*0.55+0.0005;
+    
+}
+// if(texelFetch(iChannel0, ivec2(83, 0), 0).x > 0.){
+// _R=0.000097;
+
+// }
+// if(texelFetch(iChannel0, ivec2(87, 0), 0).x > 0.){
+// _R=0.000017;
+
+// }
+vec3 _Rotcen=vec3(0.0,0.0,0.0);
+
+vec3 _Campos;
+
+    vec3 reposcam=vec3(
+    _R * sin(_Phi) * cos(_Theta),
+    _R * sin(_Phi) * sin(_Theta),
+    -_R * cos(_Phi));
+
+    _Campos = _Rotcen + reposcam;
+    vec3 vecz =vec3( 0.0,0.0,1.0 );
+
+    vec3 _X = normalize(cross(vecz, reposcam));
+    vec3 _Y = normalize(cross(reposcam, _X));
+    vec3 _Z = normalize(reposcam);
+
+    a=(transpose(mat4x4(
+        1., 0., 0., -_Campos.x,
+        0., 1., 0., -_Campos.y,
+        0., 0., 1., -_Campos.z,
+        0., 0., 0., 1.
+    ))*a);
+    
+    a=transpose(mat4x4(
+        _X.x,_X.y,_X.z,0.,
+        _Y.x,_Y.y,_Y.z,0.,
+        _Z.x,_Z.y,_Z.z,0.,
+        0.   ,0.   ,0.   ,1.)
+        )*a;
+        
+    return a;
+}
+
+vec4 GetCameraRot(vec4 a)//摄影机系旋转    本部分在实际使用时uniform输入
+{
+float _Theta=4.0*PI*iMouse.x/iResolution.x;
+float _Phi=0.999*PI*iMouse.y/iResolution.y+0.0005;
+float _R=0.000057;
+
+if(iFrame<2){
+    _Theta=4.0*PI*0.45;
+    _Phi=0.999*PI*0.55+0.0005;
+    
+}
+// if(texelFetch(iChannel0, ivec2(83, 0), 0).x > 0.){
+// _R=0.000097;
+
+// }
+// if(texelFetch(iChannel0, ivec2(87, 0), 0).x > 0.){
+// _R=0.000017;
+
+// }
+vec3 _Rotcen=vec3(0.0,0.0,0.0);
+
+vec3 _Campos;
+
+    vec3 reposcam=vec3(
+    _R * sin(_Phi) * cos(_Theta),
+    _R * sin(_Phi) * sin(_Theta),
+    -_R * cos(_Phi));
+
+    _Campos = _Rotcen + reposcam;
+    vec3 vecz =vec3( 0.0,0.0,1.0 );
+
+    vec3 _X = normalize(cross(vecz, reposcam));
+    vec3 _Y = normalize(cross(reposcam, _X));
+    vec3 _Z = normalize(reposcam);
+
+    a=transpose(mat4x4(
+        _X.x,_X.y,_X.z,0.,
+        _Y.x,_Y.y,_Y.z,0.,
+        _Z.x,_Z.y,_Z.z,0.,
+        0.   ,0.   ,0.   ,1.)
+        )*a;
+    return a;
+}
+
+// Screen是中间0.5，横向0到1，纵向0.5-0.5*y/x到0.5+0.5*y/x,不是NDC    被这个注释的语句已经没了，但我不确定，所以留着这个注释
+
+vec3 uvToDir(vec2 uv)                                                                                   //一堆坐标间变换
+{
+return normalize(vec3(FOV*(2.0*uv.x-1.0),FOV*(2.0*uv.y-1.0)*iResolution.y/iResolution.x,-1.0));
+}
+
+vec2 PosToNDC(vec4 pos)
+{
+return vec2(-pos.x/pos.z,-pos.y/pos.z*iResolution.x/iResolution.y);
+}
+
+vec2 DirToNDC(vec3 dir)
+{
+return vec2(-dir.x/dir.z,-dir.y/dir.z*iResolution.x/iResolution.y);
+}
+
+vec2 DirTouv(vec3 dir)
+{
+return vec2(0.5-0.5*dir.x/dir.z,0.5-0.5*dir.y/dir.z*iResolution.x/iResolution.y);
+}
+
+vec2 PosTouv(vec4 Pos)
+{
+return vec2(0.5-0.5*Pos.x/Pos.z,0.5-0.5*Pos.y/Pos.z*iResolution.x/iResolution.y);
+}
+
+float Shape( float x, float a, float b )//用于吸积盘截面轮廓
+{
+    float k = pow(a+b,a+b) / (pow(a,a)*pow(b,b));
+    return k * pow( x, a ) * pow( 1.0-x, b );
+}
+
+vec4 diskcolor(vec4 fragColor,float timerate,float steplength,vec3 RayPos,vec3 lastRayPos,vec3 RayDir,vec3 lastRayDir,vec3 WorldZ,vec3 BHPos,vec3 DiskDir,float Rs,float RIn,float ROut,float diskA,float TPeak4,float shiftMax){//吸积盘
+    vec3 CamOnDisk=GetBH(vec4(0.,0.,0.,1.0),BHPos,DiskDir);//黑洞系下相机位置
+    vec3 References=GetBHRot(vec4(WorldZ,1.0),BHPos,DiskDir);//用于吸积盘角度零点确定
+    vec3 PosOnDisk=GetBH(vec4(RayPos,1.0),BHPos,DiskDir);//光线黑洞系下位置
+    vec3 DirOnDisk=GetBHRot(vec4(RayDir,1.0),BHPos,DiskDir);//光线黑洞系下方向
+    
+    // 此行以下在黑洞坐标系
+
+    float PosR=length(PosOnDisk.xy);
+    float PosZ=PosOnDisk.z;
+    
+    vec4 color=vec4(0.);
+    if(abs(PosZ)<0.5*Rs && PosR<ROut && PosR>RIn){
+            
+        
+        float EffR = 1.0-((PosR-RIn)/(ROut-RIn)*0.5);
+        if((ROut-RIn)>9.0*Rs){//这个if用于大外径盘的厚度控制
+            if(PosR<5.0*Rs+RIn){
+            EffR = 1.0-((PosR-RIn)/(9.0*Rs)*0.5);
+            }else{
+            EffR = 1.0-(0.5/0.9*0.5+((PosR-RIn)/(ROut-RIn)-5.*Rs/(ROut-RIn))/(1.-5.*Rs/(ROut-RIn))*0.5);
+            }
+        }
+        
+        if((abs(PosZ)<0.5*Rs*Shape(EffR, 4.0, 0.9))||(PosZ<0.5*Rs*(1.-5.*pow(2.*(1.-EffR),2.)))){
+
+            float omega0=omega(PosR,Rs);
+            
+            //本部分应挪出raymarching部分提前计算（待办
+            float halfPiIn=PI/omega(3.0*Rs,Rs);
+            float EffTime0=fract(iTime*timerate/(halfPiIn))*halfPiIn+    0.*halfPiIn;//所有成对出现01结尾的变量,都是用于两个吸积盘叠变防止过度缠绕
+            float EffTime1=fract(iTime*timerate/(halfPiIn)+0.5)*halfPiIn+1.*halfPiIn;
+            float Ntime0=trunc(iTime*timerate/(halfPiIn));
+            float Ntime1=trunc(iTime*timerate/(halfPiIn)+0.5);
+            float phase0=2.0*PI*fract(43758.5453*sin(Ntime0));//角度随机用于防止快倍率下过渡出现明显周期重复
+            float phase1=2.0*PI*fract(43758.5453*sin(Ntime1));
+
+            float rthe=Vec2Theta(PosOnDisk.xy,References.xy);
+            float PosTheta=fract((rthe+omega0*EffTime0+phase0)/2./PI)*2.*PI;
+            
+            //计算盘温度
+            float T=pow(diskA*Rs*Rs*Rs/(PosR*PosR*PosR)*max(1.0-sqrt(RIn/PosR),0.000001),0.25);
+            //计算云相对速度
+            vec3 v=ly/lightspeed*omega0*cross(vec3(0.,0.,1.),PosOnDisk);
+            float vre=dot(-DirOnDisk,v);
+            //计算多普勒因子
+            float Dopler = sqrt((1.0+vre)/(1.0-vre));
+            //总红移量,含多普勒因子和引力红移和
+            float RedShift = Dopler*sqrt(max(1.0-Rs/PosR,0.000001))/sqrt(max(1.0-Rs/length(CamOnDisk),0.000001));
+            
+            float Rho;
+            float Thick;
+            float Vmix;
+            vec4 color0=vec4(0.);
+            vec4 color1=vec4(0.);
+            float distcol;
+            {
+            Rho = Shape(EffR, 4.0, 0.9);
+            if(abs(PosZ)<0.5*Rs*Rho){
+                Thick = 0.5*Rs*Rho*(0.4+0.6*softHold(DiskRandom0(vec3(1.5*PosTheta,PosR/Rs,1.0),1,3,80.0)));//盘厚
+                Vmix=max(0.,(1.0 - abs(PosZ) / Thick));
+                Rho *= 0.7*Vmix*Rho;
+                color0=vec4(DiskRandom0(vec3(1.*PosR/Rs,1.*PosZ/Rs,.5*PosTheta),3,6,80.0));//云本体
+                color0.xyz*=Rho*1.4*(0.2+0.8*Vmix+(0.8-0.8*Vmix)*DiskRandom0(vec3(PosR/Rs,1.5*PosTheta,PosZ/Rs),1,3,80.0));
+                color0.a*=(Rho);//*(1.0+Vmix);
+            }
+            if(abs(PosZ)<0.5*Rs*(1.-5.*pow(2.*(1.-EffR),2.))){
+                distcol=max(1.-pow(PosZ/(0.5*Rs*max(1.-5.*pow(2.*(1.-EffR),2.),0.0001)),2.),0.)*DiskRandom0(vec3(1.5*fract((1.5*rthe+PI/halfPiIn*EffTime0+phase0)/2./PI)*2.*PI,PosR/Rs,PosZ/Rs),0,6,80.0);
+                color0+=0.02*vec4(vec3(distcol),0.2*distcol)*sqrt(1.0001-DirOnDisk.z*DirOnDisk.z)*min(1.,Dopler*Dopler);
+            }
+            color0*=0.5-0.5*cos(2.*PI*fract(iTime*timerate/(halfPiIn)));//用于过渡
+            }
+            
+            PosTheta=fract((rthe+omega0*EffTime1+phase1)/(2.*PI))*2.*PI;//更新相位
+            
+            {
+            Rho = Shape(EffR, 4.0, 0.9);//同上
+            if(abs(PosZ)<0.5*Rs*Rho){
+                Thick = 0.5*Rs*Rho*(0.4+0.6*softHold(DiskRandom0(vec3(1.5*PosTheta,PosR/Rs,1.0),1,3,80.0)));
+                Vmix=max(0.,(1.0 - abs(PosZ) / Thick));
+                Rho *= 0.7*Vmix*Rho;
+                color1=vec4(DiskRandom0(vec3(1.*PosR/Rs,1.*PosZ/Rs,.5*PosTheta),3,6,80.0));
+                color1.xyz*=Rho*1.4*(0.2+0.8*Vmix+(0.8-0.8*Vmix)*DiskRandom0(vec3(PosR/Rs,1.5*PosTheta,PosZ/Rs),1,3,80.0));
+                color1.a*=(Rho);//*(1.0+Vmix);
+            }
+            if(abs(PosZ)<0.5*Rs*(1.-5.*pow(2.*(1.-EffR),2.))){
+                distcol=max(1.-pow(PosZ/(0.5*Rs*max(1.-5.*pow(2.*(1.-EffR),2.),0.0001)),2.),0.)*DiskRandom0(vec3(1.5*fract((1.5*rthe+PI/halfPiIn*EffTime1+phase1)/2./PI)*2.*PI,PosR/Rs,PosZ/Rs),0,6,80.0);
+                color1+=0.02*vec4(vec3(distcol),0.2*distcol)*sqrt(1.0001-DirOnDisk.z*DirOnDisk.z)*min(1.,Dopler*Dopler);
+            }
+            color1*=0.5-0.5*cos(2.*PI*fract(iTime*timerate/(halfPiIn)+0.5));
+            }
+            
+            color=color1+color0;
+            color*=1.0+20.*exp(-10.*(PosR-RIn)/(ROut-RIn));//内侧增加密度
+            // xyz亮度*密度  a密度
+            
+            float BrightWithoutRedshift=4.5*T*T*T*T/TPeak4;//原亮度
+            if (T>1000.){T=max(1000.,T*RedShift*Dopler*Dopler);}
+            //物理上严格的红移*多普勒高饱和度修正
+            
+            T=min(100000.0,T);
+    
+            color.xyz*=BrightWithoutRedshift*min(1.,1.8*(ROut-PosR)/(ROut-RIn))*RGB(T/exp((PosR-RIn)/(0.6*(ROut-RIn))));
+            // 原始亮度*修正颜色(给温度乘一个指数下降,避免颜色过于单调)
+            
+            color.xyz*=min(shiftMax,RedShift)*min(shiftMax,Dopler);
+            //原亮度修正*多普勒高对比度修正
+            
+            color.xyz*=pow((1.0-(1.0-min(1.,RedShift))*(PosR-RIn)/(ROut-RIn)),9.);//缝一个和红移与半径均有关的函数,使左右两侧的亮度下降不均,增加不对称性
+            color.xyz*=min(1.,1.+0.5*((PosR-RIn)/RIn+RIn/(PosR-RIn))-max(1.,RedShift));//乘一个对勾函数,降低吸积盘中间部分的亮度,避免糊成一坨白色
+            
+            //步长积累
+            color.xyz*=steplength /Rs ;
+            color.a*=  steplength /Rs;
+        }
+    }
+
+    return fragColor + color*(1.0-fragColor.a);
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{   
+    fragColor=vec4(0.,0.,0.,0.);
+    vec2 uv = fragCoord/iResolution.xy;
+    
+    float timerate=30.;//本部分在实际使用时又uniform输入，此外所有iTime*timerate应替换为游戏内时间。
+    
+    float MBH=1.49e7;//单位是太阳质量                                                                                           本部分在实际使用时uniform输入
+    float a0=0.0;//无量纲自旋系数                                                                                               本部分在实际使用时uniform输入
+    float Rs=2.*MBH*G0/lightspeed/lightspeed*Msun;//单位是米                                                                   本部分在实际使用时uniform输入
+    
+    float z1=1.+pow(1.-a0*a0,0.333333333333333)*(pow(1.+a0*a0,0.333333333333333)+pow(1.-a0,0.333333333333333));//辅助变量      本部分在实际使用时uniform输入
+    float RmsRatio=(3.+sqrt(3.*a0*a0+z1*z1)-sqrt((3.-z1)*(3.+z1+2.*sqrt(3.*a0*a0+z1*z1))))/2.;//赤道顺行最内稳定圆轨与Rs之比    本部分在实际使用时uniform输入
+    float AccEff=sqrt(1.-1./RmsRatio);//吸积放能效率,以落到Rms为准                                                              本部分在实际使用时uniform输入
+    
+    float mu=1.;//吸积物的比荷的倒数,氕为1                                                                                      本部分在实际使用时uniform输入
+    float dmdtEdd=6.327*mu/lightspeed/lightspeed*MBH*Msun/AccEff;//爱丁顿吸积率                                                本部分在实际使用时uniform输入
+        
+    float dmdt=(2e-6)*dmdtEdd;//吸积率                                                                                         本部分在实际使用时uniform输入
+    
+    float diskA=3.*G0*Msun/Rs/Rs/Rs*MBH*dmdt/(8.*PI*sigma);//吸积盘温度系数                                                     本部分在实际使用时uniform输入
+    
+    //计算峰值温度的四次方,用于自适应亮度。峰值温度出现在49RIn/36处
+    float TPeak4=diskA*0.05665278;//                                                                                          本部分在实际使用时uniform输入
+    
+    Rs=Rs/ly;//单位是ly                                                                                                       本部分在实际使用时uniform输入
+    float RIn=0.7*RmsRatio*Rs;//盘内缘,正常情况下等于最内稳定圆轨
+    float ROut=12.*Rs;//盘外缘                                                                                                本部分在实际使用时uniform输入
+    
+    float shiftMax = 1.25;//设定一个蓝移的亮度增加上限,以免亮部过于亮                                                                
+    
+    vec3 WorldZ=GetCameraRot(vec4(0.,0.,1.,1.)).xyz;
+    vec4 BHAPos=vec4(5.*Rs,0.0,0.0,1.0);//黑洞世界位置                                                                         本部分在实际使用时没有
+    vec4 BHADiskDir=vec4(normalize(vec3(0.,.2,1.0)),1.0);//吸积盘世界法向                                                     本部分在实际使用时没有
+    //以下在相机系
+    vec3 BHRPos=GetCamera(BHAPos).xyz;//                                                                                     本部分在实际使用时uniform输入
+    vec3 BHRDiskDir=GetCameraRot(BHADiskDir).xyz;//                                                                          本部分在实际使用时uniform输入
+    vec3 RayDir=uvToDir(uv+0.5*vec2(RandomStep(uv, fract(iTime * 1.0+0.5)),RandomStep(uv, fract(iTime * 1.0)))/iResolution.xy);
+    vec3 RayPos=vec3(0.0,0.0,0.0);
+    vec3 lastRayPos;
+    vec3 lastRayDir;
+    vec3 PosToBH;
+    vec3 NPosToBH;
+    float steplength=0.;
+    float lastR=length(PosToBH);
+    float costheta;
+    float dthe;    
+    float dphirate;
+    float dl;
+    float Dis;
+    bool flag=true;
+    int count=0;
+    while(flag==true){//测地raymarching
+    
+        PosToBH=RayPos-BHRPos;
+        Dis=length(PosToBH);
+        NPosToBH=PosToBH/Dis;
+        
+        if(Dis>(2.5*ROut) && Dis>lastR && count>50){//远离黑洞
+        flag=false;
+        uv=DirTouv(RayDir);
+        //fragColor+=0.5*texelFetch(iChannel1, ivec2(vec2(fract(uv.x),fract(uv.y))*iChannelResolution[1].xy), 0 )*(1.0-fragColor.a);
+        //fragColor+=vec4(.25)*(1.0-fragColor.a);
+        
+        }
+        if(Dis<0.1*Rs){//命中奇点
+        flag=false;
+        //fragColor+=vec4(0.,1.,1.,1.)*(1.0-fragColor.a);
+        }
+        if(flag==true){
+        fragColor=diskcolor(fragColor,timerate,steplength,RayPos,lastRayPos,RayDir,lastRayDir,WorldZ,BHRPos,BHRDiskDir,Rs,RIn,ROut,diskA,TPeak4,shiftMax);//吸积盘颜色
+        }
+        
+        if(fragColor.a>0.99){//被完全遮挡
+        flag=false;
+        }
+        lastRayPos=RayPos;
+        lastRayDir=RayDir;
+        lastR=Dis;
+        costheta=length(cross(NPosToBH,RayDir));//前进方向与切向夹角
+        dphirate=-1.0*costheta*costheta*costheta*(1.5*Rs/Dis);//单位长度光偏折角
+        if(count==0){
+        dl=RandomStep(uv, fract(iTime * 1.0));//光起步步长抖动
+        }else{
+        dl=1.0;
+        }
+        
+        // 第一个是光线步进长度，初始值0.15
+        dl*=0.15+0.25*min(max(0.,0.5*(0.5*Dis/max(10.*Rs,ROut)-1.)),1.);
+        
+        if((Dis)>=2.0*ROut){//在吸积盘附近缩短步长。步长作为位置的函数必须连续,最好高阶可导,不然会造成光线上步前缘与下步后缘不重合,产生条纹
+        dl*=Dis;
+        }else if((Dis)>=1.0*ROut){
+        dl*=(max(abs(dot(BHRDiskDir,PosToBH)),Rs)*(2.0*ROut-Dis)+Dis*(Dis-ROut))/ROut;
+        }else if((Dis)>=RIn){
+        dl*=max(abs(dot(BHRDiskDir,PosToBH)),Rs);
+        }else if((Dis)>2.*Rs){
+        dl*=(max(abs(dot(BHRDiskDir,PosToBH)),Rs)*(Dis-2.0*Rs)+Dis*(RIn-Dis))/(RIn-2.0*Rs);
+        }else{
+        dl*=Dis;
+        } 
+        
+        RayPos+=RayDir*dl;
+        dthe=dl/Dis*dphirate;
+        RayDir=normalize(RayDir+(dthe+dthe*dthe*dthe/3.0)*cross(cross(RayDir,NPosToBH),RayDir)/costheta);//更新方向，里面的（dthe +dthe^3/3）是tan（dthe）
+        steplength=length(RayPos-lastRayPos);
+        
+        count++;
+        
+    }
+    //为了套bloom先逆处理一遍
+    float colorRFactor=fragColor.r/fragColor.g;
+    float colorBFactor=fragColor.b/fragColor.g;
+    
+    float bloomMax = 12.0;
+    fragColor.r=min(-4.0*log(1.-pow(fragColor.r,2.2)),bloomMax*colorRFactor);
+    fragColor.g=min(-4.0*log(1.-pow(fragColor.g,2.2)),bloomMax);
+    fragColor.b=min(-4.0*log(1.-pow(fragColor.b,2.2)),bloomMax*colorBFactor);
+    fragColor.a=min(-4.0*log(1.-pow(fragColor.a,2.2)),4.0);
+        
+    //TAA
+
+    float blendWeight = 1.0-pow(0.5,(iTimeDelta)/max(min((0.131*36.0/(timerate)*(omega(3.*0.00000465,0.00000465))/(omega(3.*Rs,Rs))),0.3),0.02));//本部分在实际使用时max(min((0.131*36.0/(timerate)*(omega(3.*0.00000465,0.00000465))/(omega(3.*Rs,Rs))),0.3),0.02)由uniform输入
+    blendWeight = (iFrame<2 || iMouse.z > 0.0 ) ? 1.0 : blendWeight;
+    
+    vec4 previousColor = texelFetch(iChannel3, ivec2(fragCoord), 0); //获取前一帧的颜色
+    fragColor = (blendWeight)*fragColor+(1.0-blendWeight)*previousColor; //混合当前帧和前一帧
+        
+        //uv=DirTouv();
+        
+        //fragColor=texelFetch(iChannel1, ivec2(uv*iChannelResolution[1].xy), 0 );
+        //fragColor=vec4(0.1*log(fragColor.r+1.),0.1*log(fragColor.g+1.),0.1*log(fragColor.b+1.),0.1*log(fragColor.a+1.));
+
+}
+</script>
+
+<script id="B" type="x-shader/x-fragment">
+vec3 ColorFetch(vec2 coord)
+{
+        return texture(iChannel0, coord).rgb;   
+}
+
+vec3 Grab1(vec2 coord, const float octave, const vec2 offset)
+{
+        float scale = exp2(octave);
+    
+    coord += offset;
+    coord *= scale;
+
+        if (coord.x < 0.0 || coord.x > 1.0 || coord.y < 0.0 || coord.y > 1.0)
+    {
+            return vec3(0.0);   
+    }
+    
+    vec3 color = ColorFetch(coord);
+
+    return color;
+}
+
+vec3 Grab4(vec2 coord, const float octave, const vec2 offset)
+{
+        float scale = exp2(octave);
+    
+    coord += offset;
+    coord *= scale;
+
+        if (coord.x < 0.0 || coord.x > 1.0 || coord.y < 0.0 || coord.y > 1.0)
+    {
+            return vec3(0.0);   
+    }
+    
+    vec3 color = vec3(0.0);
+    float weights = 0.0;
+    
+    const int oversampling = 4;
+    
+    for (int i = 0; i < oversampling; i++)
+    {    	    
+        for (int j = 0; j < oversampling; j++)
+        {
+            vec2 off = (vec2(i, j) / iResolution.xy + vec2(0.0) / iResolution.xy) * scale / float(oversampling);
+            color += ColorFetch(coord + off);
+            
+
+            weights += 1.0;
+        }
+    }
+    
+    color /= weights;
+    
+    return color;
+}
+
+vec3 Grab8(vec2 coord, const float octave, const vec2 offset)
+{
+        float scale = exp2(octave);
+    
+    coord += offset;
+    coord *= scale;
+
+        if (coord.x < 0.0 || coord.x > 1.0 || coord.y < 0.0 || coord.y > 1.0)
+    {
+            return vec3(0.0);   
+    }
+    
+    vec3 color = vec3(0.0);
+    float weights = 0.0;
+    
+    const int oversampling = 8;
+    
+    for (int i = 0; i < oversampling; i++)
+    {    	    
+        for (int j = 0; j < oversampling; j++)
+        {
+            vec2 off = (vec2(i, j) / iResolution.xy + vec2(0.0) / iResolution.xy) * scale / float(oversampling);
+            color += ColorFetch(coord + off);
+            
+
+            weights += 1.0;
+        }
+    }
+    
+    color /= weights;
+    
+    return color;
+}
+
+vec3 Grab16(vec2 coord, const float octave, const vec2 offset)
+{
+        float scale = exp2(octave);
+    
+    coord += offset;
+    coord *= scale;
+
+        if (coord.x < 0.0 || coord.x > 1.0 || coord.y < 0.0 || coord.y > 1.0)
+    {
+            return vec3(0.0);   
+    }
+    
+    vec3 color = vec3(0.0);
+    float weights = 0.0;
+    
+    const int oversampling = 16;
+    
+    for (int i = 0; i < oversampling; i++)
+    {    	    
+        for (int j = 0; j < oversampling; j++)
+        {
+            vec2 off = (vec2(i, j) / iResolution.xy + vec2(0.0) / iResolution.xy) * scale / float(oversampling);
+            color += ColorFetch(coord + off);
+            
+
+            weights += 1.0;
+        }
+    }
+    
+    color /= weights;
+    
+    return color;
+}
+
+vec2 CalcOffset(float octave)
+{
+    vec2 offset = vec2(0.0);
+    
+    vec2 padding = vec2(10.0) / iResolution.xy;
+    
+    offset.x = -min(1.0, floor(octave / 3.0)) * (0.25 + padding.x);
+    
+    offset.y = -(1.0 - (1.0 / exp2(octave))) - padding.y * octave;
+
+    offset.y += min(1.0, floor(octave / 3.0)) * 0.35;
+    
+        return offset;   
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    vec2 uv = fragCoord.xy / iResolution.xy;
+    
+    
+    vec3 color = vec3(0.0);
+    
+    /*
+    Create a mipmap tree thingy with padding to prevent leaking bloom
+        
+    Since there's no mipmaps for the previous buffer and the reduction process has to be done in one pass,
+    oversampling is required for a proper result
+    */
+    color += Grab1(uv, 1.0, vec2(0.0,  0.0)   );
+    color += Grab4(uv, 2.0, vec2(CalcOffset(1.0))   );
+    color += Grab8(uv, 3.0, vec2(CalcOffset(2.0))   );
+    color += Grab16(uv, 4.0, vec2(CalcOffset(3.0))   );
+    color += Grab16(uv, 5.0, vec2(CalcOffset(4.0))   );
+    color += Grab16(uv, 6.0, vec2(CalcOffset(5.0))   );
+    color += Grab16(uv, 7.0, vec2(CalcOffset(6.0))   );
+    color += Grab16(uv, 8.0, vec2(CalcOffset(7.0))   );
+
+    fragColor = vec4(color, 1.0);
+}
+</script>
+
+<script id="C" type="x-shader/x-fragment">
+vec3 ColorFetch(vec2 coord)
+{
+        return texture(iChannel0, coord).rgb;   
+}
+
+float weights[5];
+float offsets[5];
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{    
+    
+    weights[0] = 0.19638062;
+    weights[1] = 0.29675293;
+    weights[2] = 0.09442139;
+    weights[3] = 0.01037598;
+    weights[4] = 0.00025940;
+    
+    offsets[0] = 0.00000000;
+    offsets[1] = 1.41176471;
+    offsets[2] = 3.29411765;
+    offsets[3] = 5.17647059;
+    offsets[4] = 7.05882353;
+    
+    vec2 uv = fragCoord.xy / iResolution.xy;
+    
+    vec3 color = vec3(0.0);
+    float weightSum = 0.0;
+    
+    if (uv.x < 0.52)
+    {
+        color += ColorFetch(uv) * weights[0];
+        weightSum += weights[0];
+
+        for(int i = 1; i < 5; i++)
+        {
+            vec2 offset = vec2(offsets[i]) / iResolution.xy;
+            color += ColorFetch(uv + offset * vec2(0.5, 0.0)) * weights[i];
+            color += ColorFetch(uv - offset * vec2(0.5, 0.0)) * weights[i];
+            weightSum += weights[i] * 2.0;
+        }
+
+        color /= weightSum;
+    }
+
+    fragColor = vec4(color,1.0);
+}
+</script>
+<script id="D" type="x-shader/x-fragment">
+vec3 ColorFetch(vec2 coord)
+{
+        return texture(iChannel0, coord).rgb;   
+}
+
+float weights[5];
+float offsets[5];
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{    
+    
+    weights[0] = 0.19638062;
+    weights[1] = 0.29675293;
+    weights[2] = 0.09442139;
+    weights[3] = 0.01037598;
+    weights[4] = 0.00025940;
+    
+    offsets[0] = 0.00000000;
+    offsets[1] = 1.41176471;
+    offsets[2] = 3.29411765;
+    offsets[3] = 5.17647059;
+    offsets[4] = 7.05882353;
+    
+    vec2 uv = fragCoord.xy / iResolution.xy;
+    
+    vec3 color = vec3(0.0);
+    float weightSum = 0.0;
+    
+    if (uv.x < 0.52)
+    {
+        color += ColorFetch(uv) * weights[0];
+        weightSum += weights[0];
+
+        for(int i = 1; i < 5; i++)
+        {
+            vec2 offset = vec2(offsets[i]) / iResolution.xy;
+            color += ColorFetch(uv + offset * vec2(0.0, 0.5)) * weights[i];
+            color += ColorFetch(uv - offset * vec2(0.0, 0.5)) * weights[i];
+            weightSum += weights[i] * 2.0;
+        }
+
+        color /= weightSum;
+    }
+
+    fragColor = vec4(color,1.0);
+}
+</script>
+
+<script id="Image" type="x-shader/x-fragment">
+//渲染部分在BufferA，BufferBCD和image来自sonicether的作品Gargantua With HDR Bloom
+vec3 saturate(vec3 x)
+{
+    return clamp(x, vec3(0.0), vec3(1.0));
+}
+
+vec4 cubic(float x)
+{
+    float x2 = x * x;
+    float x3 = x2 * x;
+    vec4 w;
+    w.x =   -x3 + 3.0*x2 - 3.0*x + 1.0;
+    w.y =  3.0*x3 - 6.0*x2       + 4.0;
+    w.z = -3.0*x3 + 3.0*x2 + 3.0*x + 1.0;
+    w.w =  x3;
+    return w / 6.0;
+}
+
+vec4 BicubicTexture(in sampler2D tex, in vec2 coord)
+{
+    vec2 resolution = iResolution.xy;
+
+    coord *= resolution;
+
+    float fx = fract(coord.x);
+    float fy = fract(coord.y);
+    coord.x -= fx;
+    coord.y -= fy;
+
+    fx -= 0.5;
+    fy -= 0.5;
+
+    vec4 xcubic = cubic(fx);
+    vec4 ycubic = cubic(fy);
+
+    vec4 c = vec4(coord.x - 0.5, coord.x + 1.5, coord.y - 0.5, coord.y + 1.5);
+    vec4 s = vec4(xcubic.x + xcubic.y, xcubic.z + xcubic.w, ycubic.x + ycubic.y, ycubic.z + ycubic.w);
+    vec4 offset = c + vec4(xcubic.y, xcubic.w, ycubic.y, ycubic.w) / s;
+
+    vec4 sample0 = texture(tex, vec2(offset.x, offset.z) / resolution);
+    vec4 sample1 = texture(tex, vec2(offset.y, offset.z) / resolution);
+    vec4 sample2 = texture(tex, vec2(offset.x, offset.w) / resolution);
+    vec4 sample3 = texture(tex, vec2(offset.y, offset.w) / resolution);
+
+    float sx = s.x / (s.x + s.y);
+    float sy = s.z / (s.z + s.w);
+
+    return mix( mix(sample3, sample2, sx), mix(sample1, sample0, sx), sy);
+}
+
+vec3 ColorFetch(vec2 coord)
+{
+    return texture(iChannel0, coord).rgb;   
+}
+
+vec3 BloomFetch(vec2 coord)
+{
+    return BicubicTexture(iChannel3, coord).rgb;   
+}
+
+vec3 Grab(vec2 coord, const float octave, const vec2 offset)
+{
+    float scale = exp2(octave);
+    
+    coord /= scale;
+    coord -= offset;
+
+    return BloomFetch(coord);
+}
+
+vec2 CalcOffset(float octave)
+{
+    vec2 offset = vec2(0.0);
+    
+    vec2 padding = vec2(10.0) / iResolution.xy;
+    
+    offset.x = -min(1.0, floor(octave / 3.0)) * (0.25 + padding.x);
+    
+    offset.y = -(1.0 - (1.0 / exp2(octave))) - padding.y * octave;
+
+    offset.y += min(1.0, floor(octave / 3.0)) * 0.35;
+    
+    return offset;   
+}
+
+vec3 GetBloom(vec2 coord)
+{
+    vec3 bloom = vec3(0.0);
+    
+    //Reconstruct bloom from multiple blurred images
+    bloom += Grab(coord, 1.0, vec2(CalcOffset(0.0))) * 1.0;
+    bloom += Grab(coord, 2.0, vec2(CalcOffset(1.0))) * 1.5;
+    bloom += Grab(coord, 3.0, vec2(CalcOffset(2.0))) * 1.0;
+    bloom += Grab(coord, 4.0, vec2(CalcOffset(3.0))) * 1.5;
+    bloom += Grab(coord, 5.0, vec2(CalcOffset(4.0))) * 1.8;
+    bloom += Grab(coord, 6.0, vec2(CalcOffset(5.0))) * 1.0;
+    bloom += Grab(coord, 7.0, vec2(CalcOffset(6.0))) * 1.0;
+    bloom += Grab(coord, 8.0, vec2(CalcOffset(7.0))) * 1.0;
+
+    return bloom;
+}
+
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{    
+    vec2 uv = fragCoord.xy / iResolution.xy;
+    
+    vec3 color = ColorFetch(uv);
+    
+    color += GetBloom(uv) * 0.08;
+
+    //Tonemapping and color grading
+    color = pow(color, vec3(1.5));
+    color = color / (1.0 + color);
+    color = pow(color, vec3(1.0 / 1.5));
+    
+    color = mix(color, color * color * (3.0 - 2.0 * color), vec3(1.0));
+    color = pow(color, vec3(1.3, 1.20, 1.0));    
+
+    color = saturate(color * 1.01);
+    
+    color = pow(color, vec3(0.7 / 2.2));
+
+    fragColor = vec4(color, 1.0);
+
+}    
+</script>
+
+<script>
+    // on iOS, texelFetch is not supported
+    // this is not a perfect solution, but at least gets something drawn
+    function isMobileSafari() {
+        return /iPad|iPhone|iPod/.test(window.navigator.userAgent);
+    }
+    const safariShim = isMobileSafari() == false ? '' : `
+#undef texel
+#define texel(a, p) myTexelFetchiOS(a, Bi(p))
+vec4 myTexelFetchiOS(sampler2D tex, ivec2 coord) {
+    ivec2 texSize = ivec2(iChannelResolution[0].xy);
+    ivec2 clamped = ivec2(clamp(coord.x, 0, texSize.x - 1), clamp(coord.y, 0, texSize.y - 1));
+    vec2 norm = (vec2(clamped) + 0.5) / vec2(texSize);
+    return texture(tex, norm);
+}`;
+
+    var toy = new ShaderToyLite("myCanvas");
+    // toy.setCommon(document.getElementById("Common").innerText + safariShim);
+    toy.setBufferA({ source: document.getElementById("A").innerText, iChannel3: "A" });
+    toy.setBufferB({ source: document.getElementById("B").innerText, iChannel0: "A" });
+    toy.setBufferC({ source: document.getElementById("C").innerText, iChannel0: "B" });
+    toy.setBufferD({ source: document.getElementById("D").innerText, iChannel0: "C" });
+    toy.setImage({ source: document.getElementById("Image").innerText, iChannel0: "A", iChannel1: "C", iChannel2: "B", iChannel3: "D" });
+    toy.play();
+</script>
+</body>
+
+</html>
